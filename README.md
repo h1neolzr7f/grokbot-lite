@@ -1,6 +1,6 @@
 # grokbot-lite
 
-[![CI](https://github.com/h1neolzr7f/grokbot-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/h1neolzr7f/grokbot-lite/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/badge/CI-shellcheck%20%2B%20bats-blue)](docs/ci.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64%20%7C%20systemd-blue)
 ![RAM](https://img.shields.io/badge/RAM-~190%20MB%20on%20a%202%20GiB%20VPS-brightgreen)
