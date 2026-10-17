@@ -1,0 +1,34 @@
+name: Bug report
+description: Something in grokbot-lite does not work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste tokens, one-time login URLs, credentials.json, machine.json, machine IDs or e-mail addresses.**
+        不要粘贴令牌、一次性登录链接、凭据文件、machineId 或邮箱。
+  - type: input
+    id: version
+    attributes:
+      label: grok-bot package version / arch / distro
+      placeholder: "0.71.2 / amd64 / Ubuntu 24.04"
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `grokbot-lite doctor`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs (`journalctl --user -u grok-bot-headless -n 50 --no-pager`)
+      render: text

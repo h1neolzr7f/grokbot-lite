@@ -1,0 +1,958 @@
+#!/usr/bin/env bash
+# grokbot-lite - run the official Grok Bot local-exec daemon headless on
+# low-memory Linux machines.
+#
+# What it does: flips exactly ONE Electron fuse (RunAsNode) in the official
+# grok-bot binary, after taking a verified backup, and keeps an eye on it so
+# that a package upgrade which resets the fuse is noticed.  The daemon itself
+# is started and supervised by andreanjos/grokbot-headless.
+#
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+
+readonly GBL_TOOL_VERSION="0.2.0"
+readonly SENTINEL="dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX"   # Electron fuse wire sentinel
+readonly FUSE_NAMES=(RunAsNode EnableCookieEncryption EnableNodeOptionsEnvironmentVariable
+  EnableNodeCliInspectArguments EnableEmbeddedAsarIntegrityValidation OnlyLoadAppFromAsar
+  LoadBrowserProcessSpecificV8Snapshot GrantFileProtocolExtraPrivileges WasmTrapHandlers)
+# Official package versions known to work (see compat/versions.yaml).
+readonly TESTED_VERSIONS="0.30.0 0.71.2"
+readonly TIMER_UNIT="grokbot-lite-doctor.timer"
+readonly DOCTOR_UNIT="grokbot-lite-doctor.service"
+
+# --------------------------------------------------------------------------
+# Configuration (all overridable through the environment)
+# --------------------------------------------------------------------------
+: "${HOME:=/root}"   # apt hooks may run with a minimal environment
+
+# Optional system-wide config written by install.sh on servers, e.g.
+#   GBL_SERVICE_USER=grokbot
+#   GBL_BACKUP_DIR=/var/lib/grokbot-lite/backup
+# Parsed (never sourced); only GBL_* keys are accepted; the environment wins.
+: "${GBL_CONF:=/etc/grokbot-lite.conf}"
+if [[ -r $GBL_CONF ]]; then
+  while IFS='=' read -r _k _v || [[ -n $_k ]]; do
+    case $_k in
+      GBL_SERVICE_USER | GBL_BACKUP_DIR | GBL_BINARY | GBL_NOTIFY_CMD)
+        _v=${_v%\"}; _v=${_v#\"}
+        [[ -n ${!_k:-} ]] || printf -v "$_k" '%s' "$_v" ;;
+    esac
+  done <"$GBL_CONF"
+  unset _k _v
+fi
+: "${GBL_SERVICE_USER:=}"
+: "${GBL_RUNUSER:=runuser}"
+: "${GBL_SUPERVISOR_CONFIG:=$HOME/.config/grok-bot-headless}"
+: "${GBL_SUPERVISOR_DATA:=$HOME/.local/share/grok-bot-headless}"
+: "${GBL_SUPERVISOR_BIN:=$HOME/.local/bin/grok-bot-headless}"
+: "${GBL_SUPERVISOR_UNIT:=grok-bot-headless.service}"
+: "${GBL_BACKUP_DIR:=$HOME/.local/share/grok-bot-backup}"
+: "${GBL_STATE_DIR:=${XDG_STATE_HOME:-$HOME/.local/state}/grokbot-lite}"
+: "${GBL_CONFIG_DIR:=${XDG_CONFIG_HOME:-$HOME/.config}/grokbot-lite}"
+: "${GBL_SYSTEMD_USER_DIR:=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
+: "${GBL_BIN_DIR:=$HOME/.local/bin}"
+: "${GBL_PACKAGE:=grok-bot}"
+: "${GBL_SUDO:=sudo}"
+: "${GBL_APT_HOOK:=/etc/apt/apt.conf.d/99grokbot-lite}"
+: "${GBL_APT_HELPER_DIR:=/usr/local/lib/grokbot-lite}"
+: "${GBL_NOTIFY_CMD:=}"
+
+YES=0
+DRY_RUN=0
+QUIET=0
+JSON=0
+
+# --------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  C_RED=$'\e[31m' C_YEL=$'\e[33m' C_GRN=$'\e[32m' C_DIM=$'\e[2m' C_OFF=$'\e[0m'
+else
+  C_RED="" C_YEL="" C_GRN="" C_DIM="" C_OFF=""
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { [[ $QUIET -eq 1 ]] || printf '%s\n' "${C_DIM}==>${C_OFF} $*"; }
+err()  { printf '%s\n' "${C_RED}error:${C_OFF} $*" >&2; }
+die()  { err "$*"; exit "${2:-1}"; }
+
+# Doctor result accumulator
+N_WARN=0
+N_FAIL=0
+CHECKS_JSON=""
+check_result() { # level key message
+  local level=$1 key=$2 msg=$3 tag
+  case $level in
+    ok)   tag="${C_GRN}[ OK ]${C_OFF}" ;;
+    warn) tag="${C_YEL}[WARN]${C_OFF}"; N_WARN=$((N_WARN + 1)) ;;
+    fail) tag="${C_RED}[FAIL]${C_OFF}"; N_FAIL=$((N_FAIL + 1)) ;;
+    *)    tag="[ -- ]" ;;
+  esac
+  CHECKS_JSON+="${CHECKS_JSON:+,}{\"check\":$(json_str "$key"),\"level\":$(json_str "$level"),\"message\":$(json_str "$msg")}"
+  if [[ $JSON -eq 0 ]] && { [[ $QUIET -eq 0 ]] || [[ $level == warn || $level == fail ]]; }; then
+    printf '%s %-12s %s\n' "$tag" "$key" "$msg"
+  fi
+}
+
+json_str() { # minimal JSON string escaper
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
+  printf '"%s"' "$s"
+}
+json_num_or_null() { if [[ $1 =~ ^[0-9]+$ ]]; then printf '%s' "$1"; else printf 'null'; fi; }
+json_bool() { if [[ $1 == 1 || $1 == true ]]; then printf 'true'; else printf 'false'; fi; }
+
+# --------------------------------------------------------------------------
+# Generic helpers
+# --------------------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+run() { # run a command as the current user (honours --dry-run)
+  if [[ $DRY_RUN -eq 1 ]]; then say "[dry-run] $*"; return 0; fi
+  "$@"
+}
+
+run_root() { # run a command as root (honours --dry-run); prints what it runs
+  if [[ $DRY_RUN -eq 1 ]]; then say "[dry-run] (root) $*"; return 0; fi
+  if [[ $EUID -eq 0 ]]; then "$@"; else
+    info "as root: $*"
+    "$GBL_SUDO" "$@"
+  fi
+}
+
+confirm() { # question
+  [[ $YES -eq 1 || $DRY_RUN -eq 1 ]] && return 0
+  if [[ ! -t 0 ]]; then die "'$1' needs confirmation; re-run with --yes for non-interactive use"; fi
+  local reply
+  read -r -p "$1 [y/N] " reply
+  [[ $reply == y || $reply == Y || $reply == yes ]]
+}
+
+env_file_get() { # KEY FILE -> value (systemd EnvironmentFile syntax; never sourced)
+  local key=$1 file=$2 line
+  [[ -r $file ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    case $line in
+      "$key="*)
+        line=${line#"$key="}; line=${line%\"}; line=${line#\"}
+        printf '%s\n' "$line"; return 0 ;;
+    esac
+  done <"$file"
+  return 1
+}
+
+resolve_binary() {
+  if [[ -z ${GBL_BINARY:-} ]]; then
+    GBL_BINARY=${GROK_BOT_BINARY:-}
+    if [[ -z $GBL_BINARY ]]; then
+      GBL_BINARY=$(env_file_get GROK_BOT_BINARY "$GBL_SUPERVISOR_CONFIG/environment" 2>/dev/null) || GBL_BINARY=""
+    fi
+    [[ -n $GBL_BINARY ]] || GBL_BINARY="/opt/Grok Bot/grok-bot"
+  fi
+}
+
+package_version() {
+  local v=""
+  if [[ -n ${GBL_PACKAGE_VERSION:-} ]]; then printf '%s\n' "$GBL_PACKAGE_VERSION"; return 0; fi
+  if have dpkg-query; then v=$(dpkg-query -W -f='${Version}' "$GBL_PACKAGE" 2>/dev/null) || v=""; fi
+  if [[ -z $v ]] && have rpm; then v=$(rpm -q --qf '%{VERSION}' "$GBL_PACKAGE" 2>/dev/null) || v=""; fi
+  [[ -n $v ]] || v="unknown"
+  printf '%s\n' "$v"
+}
+
+is_tested_version() { local t; for t in $TESTED_VERSIONS; do [[ $t == "$1" ]] && return 0; done; return 1; }
+
+sha256_of() { sha256sum -- "$1" | cut -d' ' -f1; }
+
+file_sha256_cached() { # use FILE.sha256 sidecar when present
+  local f=$1
+  if [[ -r $f.sha256 ]]; then cut -d' ' -f1 <"$f.sha256"; else sha256_of "$f"; fi
+}
+
+rss_kib() { # pid -> VmRSS in KiB
+  local pid=$1
+  [[ -r /proc/$pid/status ]] || return 1
+  sed -n 's/^VmRSS:[[:space:]]*\([0-9]*\).*/\1/p' "/proc/$pid/status"
+}
+
+pid_alive() { [[ $1 =~ ^[0-9]+$ ]] && kill -0 "$1" 2>/dev/null; }
+
+json_field_num() { # FILE KEY -> first numeric value of "KEY": N
+  [[ -r $1 ]] || return 1
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1
+}
+json_field_str() { # FILE KEY -> first string value of "KEY": "v"
+  [[ -r $1 ]] || return 1
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1
+}
+
+# --------------------------------------------------------------------------
+# Electron fuse wire handling
+#   layout after the 32-byte sentinel: [version:1][length:1][fuse bytes...]
+#   fuse byte: '0'(48)=disabled '1'(49)=enabled 'r'(114)=removed 0x90(144)=inherit
+# --------------------------------------------------------------------------
+FUSE_OFFSET="" FUSE_WIRE_VERSION="" FUSE_WIRE_LENGTH="" FUSE_WIRE=()
+
+read_bytes() { # FILE OFFSET COUNT -> decimal bytes separated by spaces
+  dd if="$1" bs=1 skip="$2" count="$3" status=none 2>/dev/null | od -An -v -tu1 | tr -s ' \n' '  ' | sed 's/^ //; s/ $//'
+}
+
+fuse_read() { # FILE ; return 0 ok, 2 missing, 3 no sentinel, 4 multiple sentinels, 5 bad wire
+  local file=$1 offs n hdr
+  FUSE_OFFSET="" FUSE_WIRE_VERSION="" FUSE_WIRE_LENGTH="" FUSE_WIRE=()
+  [[ -r $file ]] || return 2
+  offs=$(LC_ALL=C grep -obaF -- "$SENTINEL" "$file" | cut -d: -f1) || offs=""
+  n=$(printf '%s\n' "$offs" | grep -c '[0-9]' || true)
+  [[ $n -eq 0 ]] && return 3
+  [[ $n -gt 1 ]] && return 4
+  FUSE_OFFSET=$offs
+  read -r -a hdr <<<"$(read_bytes "$file" $((offs + ${#SENTINEL})) 2)"
+  [[ ${#hdr[@]} -eq 2 ]] || return 5
+  FUSE_WIRE_VERSION=${hdr[0]} FUSE_WIRE_LENGTH=${hdr[1]}
+  [[ $FUSE_WIRE_LENGTH -ge 1 ]] || return 5
+  read -r -a FUSE_WIRE <<<"$(read_bytes "$file" $((offs + ${#SENTINEL} + 2)) "$FUSE_WIRE_LENGTH")"
+  [[ ${#FUSE_WIRE[@]} -eq $FUSE_WIRE_LENGTH ]] || return 5
+  return 0
+}
+
+fuse_state_name() {
+  case $1 in
+    48) say disabled ;; 49) say enabled ;; 114) say removed ;; 144) say inherit ;; *) say "unknown($1)" ;;
+  esac
+}
+
+fuse_error_text() {
+  case $1 in
+    2) say "binary not found or unreadable" ;;
+    3) say "no Electron fuse sentinel (not an Electron >= 12 binary?)" ;;
+    4) say "more than one fuse sentinel (unexpected on Linux; refusing)" ;;
+    5) say "malformed fuse wire" ;;
+    *) say "unknown fuse read error ($1)" ;;
+  esac
+}
+
+runasnode_state() { # FILE -> enabled|disabled|removed|inherit|error:<text>
+  local rc=0
+  fuse_read "$1" || rc=$?
+  if [[ $rc -ne 0 ]]; then say "error:$(fuse_error_text "$rc")"; return 0; fi
+  fuse_state_name "${FUSE_WIRE[0]}"
+}
+
+patch_runasnode_in_place() { # FILE (must be writable by us); flips ONLY byte 0 of the wire
+  local file=$1 rc=0 before after pos i
+  fuse_read "$file" || rc=$?
+  [[ $rc -eq 0 ]] || die "cannot read fuses of $file: $(fuse_error_text "$rc")"
+  [[ $FUSE_WIRE_VERSION -eq 1 ]] || die "unsupported fuse wire version $FUSE_WIRE_VERSION (expected 1)"
+  case ${FUSE_WIRE[0]} in
+    49) return 0 ;;
+    48 | 144) ;;
+    114) die "RunAsNode fuse is marked REMOVED in this Electron build; it cannot be enabled" ;;
+    *) die "unexpected RunAsNode fuse byte ${FUSE_WIRE[0]}" ;;
+  esac
+  before=("${FUSE_WIRE[@]}")
+  pos=$((FUSE_OFFSET + ${#SENTINEL} + 2))
+  printf '1' | dd of="$file" bs=1 seek="$pos" count=1 conv=notrunc status=none
+  fuse_read "$file" || die "fuse wire unreadable after patch"
+  after=("${FUSE_WIRE[@]}")
+  [[ ${after[0]} -eq 49 ]] || die "verification failed: RunAsNode not enabled after patch"
+  for ((i = 1; i < ${#before[@]}; i++)); do
+    [[ ${before[$i]} -eq ${after[$i]} ]] || die "verification failed: fuse $i changed unexpectedly"
+  done
+}
+
+check_free_space() { # DIR BYTES_NEEDED
+  local avail
+  avail=$(df -Pk -- "$1" 2>/dev/null | awk 'NR==2 {print $4}') || return 0
+  [[ -n $avail ]] || return 0
+  if ((avail * 1024 < $2)); then die "not enough free space in $1 (need $(($2 / 1048576)) MiB)"; fi
+}
+
+atomic_replace() { # SRC DEST : root-owned install of SRC next to DEST, then rename over DEST
+  local src=$1 dest=$2 dir base tmp owner group mode
+  dir=$(dirname -- "$dest") base=$(basename -- "$dest")
+  tmp="$dir/.$base.grokbot-lite-new"
+  read -r owner group mode <<<"$(stat -c '%u %g %a' -- "$dest")"
+  # rename(2) instead of writing in place: a running daemon keeps its old inode,
+  # and writing to a busy executable would fail with ETXTBSY anyway.
+  run_root install -o "$owner" -g "$group" -m "$mode" -- "$src" "$tmp"
+  if ! run_root mv -f -- "$tmp" "$dest"; then
+    run_root rm -f -- "$tmp" || true
+    die "could not move patched binary into place"
+  fi
+}
+
+backup_path_for() { printf '%s/%s.%s\n' "$GBL_BACKUP_DIR" "$(basename -- "$GBL_BINARY")" "$1"; }
+
+find_pristine_backup() { # VERSION -> path of a backup of VERSION with RunAsNode not enabled
+  local ver=$1 f
+  for f in "$(backup_path_for "$ver")" "$(backup_path_for "$ver")".*; do
+    [[ -f $f && $f != *.sha256 ]] || continue
+    [[ $(runasnode_state "$f") == enabled ]] && continue
+    printf '%s\n' "$f"; return 0
+  done
+  return 1
+}
+
+ensure_backup() { # create a verified backup of the current (unpatched) binary
+  local ver dest cur size
+  ver=$(package_version)
+  if find_pristine_backup "$ver" >/dev/null; then
+    info "backup for $ver already present: $(find_pristine_backup "$ver")"; return 0
+  fi
+  [[ $(runasnode_state "$GBL_BINARY") != enabled ]] ||
+    die "binary already has RunAsNode enabled and there is no pristine backup; reinstall the package (e.g. sudo apt reinstall $GBL_PACKAGE) first"
+  dest=$(backup_path_for "$ver")
+  cur=$(sha256_of "$GBL_BINARY")
+  if [[ -e $dest ]]; then dest="$dest.${cur:0:12}"; fi
+  size=$(stat -c %s -- "$GBL_BINARY")
+  run mkdir -p -- "$GBL_BACKUP_DIR"
+  [[ $DRY_RUN -eq 1 ]] || check_free_space "$GBL_BACKUP_DIR" "$size"
+  info "backing up $GBL_BINARY -> $dest"
+  run cp -- "$GBL_BINARY" "$dest"
+  if [[ $DRY_RUN -eq 0 ]]; then
+    [[ $(sha256_of "$dest") == "$cur" ]] || { rm -f -- "$dest"; die "backup verification failed"; }
+    printf '%s  %s\n' "$cur" "$(basename -- "$dest")" >"$dest.sha256"
+  fi
+}
+
+flip_fuse() { # backup, patch a user-owned copy, verify, then atomically move into place
+  local state work size
+  state=$(runasnode_state "$GBL_BINARY")
+  case $state in
+    enabled) info "RunAsNode already enabled in $GBL_BINARY - nothing to do"; return 0 ;;
+    disabled | inherit) ;;
+    error:*) die "${state#error:}: $GBL_BINARY" ;;
+    *) die "cannot enable RunAsNode (state: $state)" ;;
+  esac
+  ensure_backup
+  confirm "Enable ONLY the RunAsNode fuse in '$GBL_BINARY' (needs sudo)?" || die "aborted"
+  if [[ $DRY_RUN -eq 1 ]]; then say "[dry-run] patch RunAsNode byte at wire offset 0 and replace $GBL_BINARY"; return 0; fi
+  size=$(stat -c %s -- "$GBL_BINARY")
+  mkdir -p -- "$GBL_STATE_DIR"
+  check_free_space "$GBL_STATE_DIR" "$size"
+  work="$GBL_STATE_DIR/patch.$$"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$work'" EXIT
+  cp -- "$GBL_BINARY" "$work"
+  patch_runasnode_in_place "$work"
+  atomic_replace "$work" "$GBL_BINARY"
+  rm -f -- "$work"; trap - EXIT
+  [[ $(runasnode_state "$GBL_BINARY") == enabled ]] || die "post-install verification failed"
+  say "${C_GRN}RunAsNode enabled${C_OFF} in $GBL_BINARY (other fuses untouched)"
+}
+
+# --------------------------------------------------------------------------
+# Embedded unit files (kept identical to systemd/ in the repository; tested)
+# --------------------------------------------------------------------------
+unit_doctor_service() {
+  cat <<'EOF'
+[Unit]
+Description=grokbot-lite: check the headless Grok Bot daemon (RunAsNode fuse, supervisor, policy)
+After=grok-bot-headless.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/grokbot-lite/config
+ExecStart=%h/.local/bin/grokbot-lite doctor --quiet --notify
+# doctor: 0 = healthy, 1 = warnings only, 2 = failure (unit shows as failed)
+SuccessExitStatus=1
+Nice=10
+IOSchedulingClass=idle
+EOF
+}
+
+unit_doctor_timer() {
+  cat <<'EOF'
+[Unit]
+Description=grokbot-lite: periodic doctor run (detects fuse reset after package upgrades)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+RandomizedDelaySec=60
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+apt_hook_content() { # BINARY_PATH
+  printf '%s\n' "// Installed by grokbot-lite. Warn-only: never modifies anything, never runs npx/network."
+  printf 'DPkg::Post-Invoke { "if [ -x %s/grokbot-lite ]; then GBL_BINARY='\''%s'\'' %s/grokbot-lite apt-check || true; fi"; };\n' \
+    "$GBL_APT_HELPER_DIR" "$1" "$GBL_APT_HELPER_DIR"
+}
+
+systemctl_user() { systemctl --user "$@"; }
+
+user_exec() { # USER CMD... : run CMD as USER with a usable systemd --user environment
+  local u=$1 uid home; shift
+  uid=$(id -u -- "$u") || die "user '$u' does not exist"
+  home=$(getent passwd "$u" | cut -d: -f6)
+  "$GBL_RUNUSER" -u "$u" -- env HOME="$home" USER="$u" LOGNAME="$u" XDG_RUNTIME_DIR="/run/user/$uid" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" PATH="$PATH" \
+    GBL_BACKUP_DIR="$GBL_BACKUP_DIR" GBL_BINARY="${GBL_BINARY:-}" NO_COLOR="${NO_COLOR:-}" "$@"
+}
+
+restart_supervisor() {
+  if [[ $EUID -eq 0 && -n $GBL_SERVICE_USER ]]; then
+    run user_exec "$GBL_SERVICE_USER" systemctl --user restart "$GBL_SUPERVISOR_UNIT"
+  else
+    run systemctl_user restart "$GBL_SUPERVISOR_UNIT"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# Status collection (read-only)
+# --------------------------------------------------------------------------
+collect() {
+  resolve_binary
+  S_BIN_EXISTS=0; [[ -f $GBL_BINARY ]] && S_BIN_EXISTS=1
+  S_VERSION=$(package_version)
+  S_TESTED=0; is_tested_version "$S_VERSION" && S_TESTED=1
+  local rc=0
+  fuse_read "$GBL_BINARY" || rc=$?
+  if [[ $rc -eq 0 ]]; then S_FUSE=$(fuse_state_name "${FUSE_WIRE[0]}"); else S_FUSE="error:$(fuse_error_text "$rc")"; fi
+  S_WIRE_VERSION=$FUSE_WIRE_VERSION S_WIRE_LENGTH=$FUSE_WIRE_LENGTH S_FUSE_OFFSET=$FUSE_OFFSET
+  S_SHA=""; [[ $S_BIN_EXISTS -eq 1 && ${GBL_SKIP_SHA:-0} != 1 ]] && S_SHA=$(sha256_of "$GBL_BINARY")
+  S_BACKUP=$(find_pristine_backup "$S_VERSION" 2>/dev/null) || S_BACKUP=""
+  S_BACKUP_VERSIONS=""
+  local f b
+  if [[ -d $GBL_BACKUP_DIR ]]; then
+    b=$(basename -- "$GBL_BINARY")
+    for f in "$GBL_BACKUP_DIR/$b".*; do
+      [[ -f $f && $f != *.sha256 ]] || continue
+      S_BACKUP_VERSIONS+="${S_BACKUP_VERSIONS:+ }${f##*/"$b".}"
+    done
+  fi
+  S_BACKUP_SHA=""; [[ -n $S_BACKUP && ${GBL_SKIP_SHA:-0} != 1 ]] && S_BACKUP_SHA=$(file_sha256_cached "$S_BACKUP")
+  # relation between live binary and pristine backup:
+  #   identical | runasnode-only (exactly our one-byte patch) | different | unknown
+  S_BACKUP_REL=unknown
+  if [[ -n $S_BACKUP && $S_BIN_EXISTS -eq 1 ]]; then
+    local diffs
+    diffs=$(cmp -l -- "$GBL_BINARY" "$S_BACKUP" 2>/dev/null | head -n 2) || true
+    if [[ -z $diffs ]] && cmp -s -- "$GBL_BINARY" "$S_BACKUP"; then S_BACKUP_REL=identical
+    elif [[ -n $S_FUSE_OFFSET && $diffs =~ ^[[:space:]]*([0-9]+)[[:space:]]+61[[:space:]]+(60|220)$ &&
+      ${BASH_REMATCH[1]} -eq $((S_FUSE_OFFSET + ${#SENTINEL} + 3)) ]]; then S_BACKUP_REL=runasnode-only
+    elif [[ -n $diffs ]]; then S_BACKUP_REL=different; fi
+  fi
+
+  S_SUP_INSTALLED=0; [[ -x $GBL_SUPERVISOR_BIN ]] && S_SUP_INSTALLED=1
+  S_SUP_ENABLED=$(systemctl_user is-enabled "$GBL_SUPERVISOR_UNIT" 2>/dev/null) || true
+  S_SUP_ACTIVE=$(systemctl_user is-active "$GBL_SUPERVISOR_UNIT" 2>/dev/null) || true
+  [[ -n $S_SUP_ENABLED ]] || S_SUP_ENABLED=unknown
+  [[ -n $S_SUP_ACTIVE ]] || S_SUP_ACTIVE=unknown
+  S_SUP_PID=$(systemctl_user show -p MainPID --value "$GBL_SUPERVISOR_UNIT" 2>/dev/null) || S_SUP_PID=""
+  [[ $S_SUP_PID =~ ^[1-9][0-9]*$ ]] || S_SUP_PID=""
+  S_SUP_RSS=""; [[ -n $S_SUP_PID ]] && { S_SUP_RSS=$(rss_kib "$S_SUP_PID") || S_SUP_RSS=""; }
+
+  S_DAEMON_PID=$(json_field_num "$GBL_SUPERVISOR_DATA/local-exec-daemon.json" pid 2>/dev/null) || S_DAEMON_PID=""
+  if ! pid_alive "${S_DAEMON_PID:-x}"; then
+    S_DAEMON_PID=""
+    if have pgrep; then S_DAEMON_PID=$(pgrep -n -f 'local-exec-daemon/main\.cjs' 2>/dev/null) || S_DAEMON_PID=""; fi
+  fi
+  S_DAEMON_RSS=""; [[ -n $S_DAEMON_PID ]] && { S_DAEMON_RSS=$(rss_kib "$S_DAEMON_PID") || S_DAEMON_RSS=""; }
+
+  # login state: presence only - credential files are never read
+  S_CREDS=0; [[ -f $GBL_SUPERVISOR_CONFIG/credentials.json ]] && S_CREDS=1
+  S_MACHINE=0; [[ -f $GBL_SUPERVISOR_CONFIG/machine.json ]] && S_MACHINE=1
+  S_HEARTBEAT_AGE=""
+  if [[ -f $GBL_SUPERVISOR_DATA/local-exec-supervisor.json ]]; then
+    S_HEARTBEAT_AGE=$(($(date +%s) - $(stat -c %Y -- "$GBL_SUPERVISOR_DATA/local-exec-supervisor.json")))
+  fi
+  S_POLICY=$(json_field_str "$GBL_SUPERVISOR_DATA/settings.json" localToolPermission 2>/dev/null) || S_POLICY=""
+  S_POLICY_SOURCE=settings
+  [[ -n $S_POLICY ]] || { S_POLICY=ask; S_POLICY_SOURCE=default; }
+
+  S_SUDO_NOPASSWD=unknown S_SUDO_NOGROUP=0
+  if [[ ${GBL_SKIP_SUDO_CHECK:-0} != 1 ]] && have "$GBL_SUDO"; then
+    if [[ $EUID -ne 0 && ${GBL_SUDO_PROBE_ALWAYS:-0} != 1 ]] &&
+      ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qxE 'sudo|wheel|admin'; then
+      S_SUDO_NOPASSWD=no S_SUDO_NOGROUP=1   # not in an admin group: skip the probe (avoids "not in sudoers" incident mails)
+    elif "$GBL_SUDO" -n true >/dev/null 2>&1; then S_SUDO_NOPASSWD=yes; else S_SUDO_NOPASSWD=no; fi
+  fi
+  S_LINGER=$(loginctl show-user "${USER:-$(id -un)}" -p Linger --value 2>/dev/null) || S_LINGER=""
+  [[ -n $S_LINGER ]] || S_LINGER=unknown
+  S_TIMER_INSTALLED=0; [[ -f $GBL_SYSTEMD_USER_DIR/$TIMER_UNIT ]] && S_TIMER_INSTALLED=1
+  S_TIMER_ACTIVE=$(systemctl_user is-active "$TIMER_UNIT" 2>/dev/null) || true
+  [[ -n $S_TIMER_ACTIVE ]] || S_TIMER_ACTIVE=unknown
+  S_APT_HOOK=0; [[ -f $GBL_APT_HOOK ]] && S_APT_HOOK=1
+  return 0
+}
+
+status_json() {
+  local versions="" v
+  for v in $S_BACKUP_VERSIONS; do versions+="${versions:+,}$(json_str "$v")"; done
+  printf '{'
+  printf '"tool":"grokbot-lite","toolVersion":%s,' "$(json_str "$GBL_TOOL_VERSION")"
+  printf '"binary":{"path":%s,"exists":%s,"packageVersion":%s,"testedVersion":%s,"sha256":%s},' \
+    "$(json_str "$GBL_BINARY")" "$(json_bool "$S_BIN_EXISTS")" "$(json_str "$S_VERSION")" "$(json_bool "$S_TESTED")" "$(json_str "$S_SHA")"
+  printf '"fuse":{"runAsNode":%s,"wireVersion":%s,"wireLength":%s},' \
+    "$(json_str "$S_FUSE")" "$(json_num_or_null "$S_WIRE_VERSION")" "$(json_num_or_null "$S_WIRE_LENGTH")"
+  printf '"backup":{"dir":%s,"forInstalledVersion":%s,"path":%s,"sha256":%s,"relationToInstalled":%s,"versions":[%s]},' \
+    "$(json_str "$GBL_BACKUP_DIR")" "$(json_bool "$([[ -n $S_BACKUP ]] && echo 1)")" "$(json_str "$S_BACKUP")" \
+    "$(json_str "$S_BACKUP_SHA")" "$(json_str "$S_BACKUP_REL")" "$versions"
+  printf '"supervisor":{"installed":%s,"unit":%s,"enabled":%s,"active":%s,"pid":%s,"rssKiB":%s},' \
+    "$(json_bool "$S_SUP_INSTALLED")" "$(json_str "$GBL_SUPERVISOR_UNIT")" "$(json_str "$S_SUP_ENABLED")" \
+    "$(json_str "$S_SUP_ACTIVE")" "$(json_num_or_null "$S_SUP_PID")" "$(json_num_or_null "$S_SUP_RSS")"
+  printf '"daemon":{"running":%s,"pid":%s,"rssKiB":%s},' \
+    "$(json_bool "$([[ -n $S_DAEMON_PID ]] && echo 1)")" "$(json_num_or_null "$S_DAEMON_PID")" "$(json_num_or_null "$S_DAEMON_RSS")"
+  printf '"login":{"credentialsPresent":%s,"machineIdentityPresent":%s,"heartbeatAgeSec":%s},' \
+    "$(json_bool "$S_CREDS")" "$(json_bool "$S_MACHINE")" "$(json_num_or_null "$S_HEARTBEAT_AGE")"
+  printf '"policy":{"value":%s,"source":%s},' "$(json_str "$S_POLICY")" "$(json_str "$S_POLICY_SOURCE")"
+  printf '"passwordlessSudo":%s,"linger":%s,' "$(json_str "$S_SUDO_NOPASSWD")" "$(json_str "$S_LINGER")"
+  printf '"timer":{"installed":%s,"active":%s},"aptHook":{"installed":%s}' \
+    "$(json_bool "$S_TIMER_INSTALLED")" "$(json_str "$S_TIMER_ACTIVE")" "$(json_bool "$S_APT_HOOK")"
+  if [[ -n $CHECKS_JSON ]]; then printf ',"summary":{"warnings":%d,"failures":%d},"checks":[%s]' "$N_WARN" "$N_FAIL" "$CHECKS_JSON"; fi
+  printf '}\n'
+}
+
+mib() { [[ $1 =~ ^[0-9]+$ ]] && printf '%d MiB' $(((${1} + 512) / 1024)) || printf 'n/a'; }
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+cmd_doctor() {
+  local notify=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --json) JSON=1 ;; --quiet | -q) QUIET=1 ;; --notify) notify=1 ;;
+      *) die "doctor: unknown option $1" ;;
+    esac
+    shift
+  done
+  collect
+
+  if [[ $S_BIN_EXISTS -eq 1 ]]; then check_result ok binary "$GBL_BINARY"
+  else check_result fail binary "not found: $GBL_BINARY (set GBL_BINARY)"; fi
+
+  if [[ $S_TESTED -eq 1 ]]; then check_result ok version "$GBL_PACKAGE $S_VERSION (tested)"
+  else check_result warn version "$GBL_PACKAGE $S_VERSION is not in the tested list ($TESTED_VERSIONS); run compat/detect.sh and report"; fi
+
+  case $S_FUSE in
+    enabled) check_result ok fuse "RunAsNode enabled (wire v$S_WIRE_VERSION, $S_WIRE_LENGTH fuses)" ;;
+    disabled | inherit)
+      check_result fail fuse "RunAsNode is $S_FUSE - probably reset by a package upgrade. Fix: grokbot-lite fix" ;;
+    removed) check_result fail fuse "RunAsNode fuse REMOVED in this Electron build - this method cannot work" ;;
+    *) check_result fail fuse "${S_FUSE#error:}" ;;
+  esac
+
+  if [[ -n $S_BACKUP ]]; then
+    case $S_BACKUP_REL in
+      runasnode-only) check_result ok backup "pristine backup for $S_VERSION; live binary = backup + RunAsNode byte only" ;;
+      identical) check_result ok backup "pristine backup for $S_VERSION (identical to live binary)" ;;
+      different) check_result warn backup "live binary differs from backup $S_BACKUP beyond the RunAsNode byte" ;;
+      *) check_result ok backup "pristine backup for $S_VERSION: $S_BACKUP" ;;
+    esac
+  elif [[ -n $S_BACKUP_VERSIONS ]]; then
+    check_result warn backup "no backup for installed $S_VERSION (have: $S_BACKUP_VERSIONS) - package was upgraded; 'grokbot-lite fix' backs it up"
+  elif [[ $EUID -ne 0 && ! -r $GBL_BACKUP_DIR && $GBL_BACKUP_DIR == /root/* ]]; then
+    check_result warn backup "backups in $GBL_BACKUP_DIR are not readable by $(id -un); verify as root: GBL_NO_REEXEC=1 grokbot-lite doctor"
+  else
+    check_result warn backup "no backup in $GBL_BACKUP_DIR; restore would need: sudo apt reinstall $GBL_PACKAGE"
+  fi
+
+  if [[ $S_SUP_INSTALLED -eq 0 ]]; then
+    check_result fail supervisor "$GBL_SUPERVISOR_BIN not installed (see andreanjos/grokbot-headless)"
+  elif [[ $S_SUP_ACTIVE == active ]]; then
+    check_result ok supervisor "$GBL_SUPERVISOR_UNIT active, $S_SUP_ENABLED, pid ${S_SUP_PID:-?}, RSS $(mib "$S_SUP_RSS")"
+  else
+    check_result fail supervisor "$GBL_SUPERVISOR_UNIT is $S_SUP_ACTIVE ($S_SUP_ENABLED)"
+  fi
+  [[ $S_SUP_INSTALLED -eq 1 && $S_SUP_ENABLED != enabled ]] &&
+    check_result warn autostart "$GBL_SUPERVISOR_UNIT is $S_SUP_ENABLED (systemctl --user enable $GBL_SUPERVISOR_UNIT)"
+
+  if [[ -n $S_DAEMON_PID ]]; then check_result ok daemon "local-exec daemon pid $S_DAEMON_PID, RSS $(mib "$S_DAEMON_RSS")"
+  else check_result fail daemon "local-exec daemon not running"; fi
+
+  if [[ $S_CREDS -eq 1 ]]; then
+    if [[ -n $S_HEARTBEAT_AGE && $S_HEARTBEAT_AGE -le 120 ]]; then
+      check_result ok login "credentials present, supervisor heartbeat ${S_HEARTBEAT_AGE}s ago"
+    else
+      check_result warn login "credentials present but no fresh supervisor heartbeat (${S_HEARTBEAT_AGE:-none})"
+    fi
+  else
+    check_result fail login "not logged in: run grok-bot-headless login (open the URL yourself; never share it)"
+  fi
+
+  case $S_POLICY in
+    ask) check_result ok policy "ask ($S_POLICY_SOURCE)" ;;
+    never) check_result warn policy "never - remote local actions are rejected" ;;
+    always)
+      if [[ $S_SUDO_NOPASSWD == yes ]]; then
+        check_result fail policy "ALWAYS + passwordless sudo = unattended remote root. Run: grok-bot-headless policy ask"
+      else
+        check_result warn policy "always - commands run without approval. Recommended: grok-bot-headless policy ask"
+      fi ;;
+    *) check_result warn policy "unrecognised policy '$S_POLICY'" ;;
+  esac
+
+  case $S_SUDO_NOPASSWD in
+    yes) check_result warn sudo "passwordless sudo is enabled for this user; keep policy=ask (or use a dedicated user)" ;;
+    no)
+      if [[ $S_SUDO_NOGROUP -eq 1 ]]; then check_result ok sudo "no sudo rights (not in sudo/wheel/admin) - ideal for a service user"
+      else check_result ok sudo "sudo requires a password"; fi ;;
+    *) check_result info sudo "not checked" ;;
+  esac
+
+  case $S_LINGER in
+    yes) check_result ok linger "enabled (service starts at boot without login)" ;;
+    *) check_result warn linger "$S_LINGER - run: sudo loginctl enable-linger ${USER:-\$USER}" ;;
+  esac
+
+  if [[ $S_TIMER_INSTALLED -eq 1 ]]; then check_result ok timer "$TIMER_UNIT $S_TIMER_ACTIVE"
+  else check_result warn timer "$TIMER_UNIT not installed (grokbot-lite install-timer)"; fi
+
+  [[ $notify -eq 1 ]] && doctor_notify
+  if [[ $JSON -eq 1 ]]; then status_json
+  elif [[ $QUIET -eq 0 ]]; then say "-- $N_FAIL failure(s), $N_WARN warning(s)"; fi
+  if [[ $N_FAIL -gt 0 ]]; then return 2; elif [[ $N_WARN -gt 0 ]]; then return 1; fi
+  return 0
+}
+
+doctor_notify() { # log every run, alert only on state transitions
+  local last="" msg now
+  mkdir -p -- "$GBL_STATE_DIR"
+  now=$(date '+%Y-%m-%dT%H:%M:%S%z')
+  [[ -r $GBL_STATE_DIR/last-fuse-state ]] && last=$(cat -- "$GBL_STATE_DIR/last-fuse-state")
+  printf '%s fuse=%s version=%s failures=%d warnings=%d\n' "$now" "$S_FUSE" "$S_VERSION" "$N_FAIL" "$N_WARN" >>"$GBL_STATE_DIR/doctor.log"
+  tail -n 500 -- "$GBL_STATE_DIR/doctor.log" >"$GBL_STATE_DIR/doctor.log.tmp" && mv -f -- "$GBL_STATE_DIR/doctor.log.tmp" "$GBL_STATE_DIR/doctor.log"
+  printf '%s\n' "$S_FUSE" >"$GBL_STATE_DIR/last-fuse-state"
+  if [[ $S_FUSE != enabled && $last != "$S_FUSE" ]]; then
+    msg="grokbot-lite: RunAsNode fuse is '$S_FUSE' on $(hostname) ($GBL_PACKAGE $S_VERSION). The headless daemon will not start after its next restart. Fix: grokbot-lite fix"
+  elif [[ $S_FUSE == enabled && -n $last && $last != enabled ]]; then
+    msg="grokbot-lite: RunAsNode fuse is enabled again on $(hostname)."
+  else
+    return 0
+  fi
+  printf '%s\n' "$msg" >&2
+  if have logger; then logger -t grokbot-lite -p user.warning -- "$msg" 2>/dev/null || true; fi
+  if have notify-send && [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]]; then notify-send "grokbot-lite" "$msg" 2>/dev/null || true; fi
+  if [[ -n $GBL_NOTIFY_CMD ]]; then printf '%s\n' "$msg" | sh -c "$GBL_NOTIFY_CMD" || err "GBL_NOTIFY_CMD failed"; fi
+}
+
+cmd_status() {
+  while [[ $# -gt 0 ]]; do
+    case $1 in --json) JSON=1 ;; *) die "status: unknown option $1" ;; esac
+    shift
+  done
+  collect
+  if [[ $JSON -eq 1 ]]; then status_json; return 0; fi
+  say "grokbot-lite $GBL_TOOL_VERSION"
+  say "  binary     $GBL_BINARY ($GBL_PACKAGE $S_VERSION)"
+  say "  RunAsNode  $S_FUSE"
+  say "  backup     ${S_BACKUP:-none for $S_VERSION}"
+  say "  supervisor $S_SUP_ACTIVE / $S_SUP_ENABLED, RSS $(mib "$S_SUP_RSS")"
+  say "  daemon     ${S_DAEMON_PID:-not running}${S_DAEMON_PID:+, RSS $(mib "$S_DAEMON_RSS")}"
+  say "  policy     $S_POLICY   linger $S_LINGER   passwordless-sudo $S_SUDO_NOPASSWD"
+}
+
+cmd_read_fuse() {
+  local file=${1:-} rc=0 i
+  resolve_binary; [[ -n $file ]] || file=$GBL_BINARY
+  fuse_read "$file" || rc=$?
+  [[ $rc -eq 0 ]] || die "$(fuse_error_text "$rc"): $file" 3
+  say "file:         $file"
+  say "wire version: $FUSE_WIRE_VERSION"
+  say "wire length:  $FUSE_WIRE_LENGTH"
+  for ((i = 0; i < FUSE_WIRE_LENGTH; i++)); do
+    printf '  %-40s %s\n' "${FUSE_NAMES[$i]:-Fuse$i}" "$(fuse_state_name "${FUSE_WIRE[$i]}")"
+  done
+}
+
+cmd_fix() {
+  local restart=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in --restart) restart=1 ;; *) die "fix: unknown option $1" ;; esac
+    shift
+  done
+  resolve_binary
+  flip_fuse
+  if [[ $restart -eq 1 ]]; then
+    restart_supervisor
+  else
+    info "restart the supervisor to pick up the change: systemctl --user restart $GBL_SUPERVISOR_UNIT (or use --restart)"
+  fi
+}
+
+cmd_restore() {
+  local force=0 ver backup want
+  while [[ $# -gt 0 ]]; do
+    case $1 in --force) force=1 ;; *) die "restore: unknown option $1" ;; esac
+    shift
+  done
+  resolve_binary
+  ver=$(package_version)
+  backup=$(find_pristine_backup "$ver") || backup=""
+  if [[ -z $backup ]]; then
+    if [[ $force -eq 1 ]]; then
+      backup=$(find "$GBL_BACKUP_DIR" -maxdepth 1 -type f -name "$(basename -- "$GBL_BINARY").*" ! -name '*.sha256' 2>/dev/null | sort | tail -n1)
+      [[ -n $backup ]] || die "no backups in $GBL_BACKUP_DIR"
+      err "using backup of a DIFFERENT version: $backup (installed: $ver)"
+    else
+      die "no backup for installed version $ver. Safer alternative: sudo apt reinstall $GBL_PACKAGE (or --force to use another version's backup)"
+    fi
+  fi
+  if [[ -r $backup.sha256 ]]; then
+    want=$(cut -d' ' -f1 <"$backup.sha256")
+    [[ $(sha256_of "$backup") == "$want" ]] || die "backup $backup does not match its .sha256 - refusing"
+  fi
+  confirm "Restore original '$GBL_BINARY' from $backup? (the headless daemon will stop working after its next restart)" || die "aborted"
+  atomic_replace "$backup" "$GBL_BINARY"
+  [[ $DRY_RUN -eq 1 ]] || say "restored $GBL_BINARY (RunAsNode: $(runasnode_state "$GBL_BINARY"))"
+}
+
+require_not_root() {
+  [[ $EUID -ne 0 || ${GBL_ALLOW_ROOT:-0} == 1 ]] || die "run as your normal user (sudo is used only for the steps that need it)"
+}
+
+install_self() {
+  local self
+  self=$(readlink -f -- "${BASH_SOURCE[0]}")
+  run mkdir -p -- "$GBL_BIN_DIR"
+  if [[ $self != "$(readlink -f -- "$GBL_BIN_DIR/grokbot-lite" 2>/dev/null || true)" ]]; then
+    run install -m 0755 -- "$self" "$GBL_BIN_DIR/grokbot-lite"
+  fi
+}
+
+cmd_switch_account() { # logout + login + policy ask + start (fixes "logged into the wrong account")
+  require_not_root
+  [[ -x $GBL_SUPERVISOR_BIN ]] || die "supervisor not installed: $GBL_SUPERVISOR_BIN"
+  confirm "Log out the current Grok Bot account on this machine and log in again?" || die "aborted"
+  run "$GBL_SUPERVISOR_BIN" logout          # also stops the service
+  say "Open the one-time URL below in YOUR browser, logged into the RIGHT Grok Bot account. Never share it."
+  run "$GBL_SUPERVISOR_BIN" login
+  run "$GBL_SUPERVISOR_BIN" policy ask      # never 'always'
+  run systemctl_user daemon-reload
+  run systemctl_user start "$GBL_SUPERVISOR_UNIT"
+  say "${C_GRN}account switched.${C_OFF} Check with: grokbot-lite doctor"
+}
+
+cmd_install_timer() {
+  install_self
+  run mkdir -p -- "$GBL_SYSTEMD_USER_DIR"
+  if [[ $DRY_RUN -eq 0 ]]; then
+    unit_doctor_service >"$GBL_SYSTEMD_USER_DIR/$DOCTOR_UNIT"
+    unit_doctor_timer >"$GBL_SYSTEMD_USER_DIR/$TIMER_UNIT"
+  else say "[dry-run] write $GBL_SYSTEMD_USER_DIR/{$DOCTOR_UNIT,$TIMER_UNIT}"; fi
+  run systemctl_user daemon-reload
+  run systemctl_user enable --now "$TIMER_UNIT"
+}
+
+cmd_install_apt_hook() {
+  resolve_binary
+  have apt-get || die "apt not found; the hook is only for Debian/Ubuntu"
+  case $GBL_BINARY in *\'* | *\"*) die "binary path contains quotes; cannot write apt hook safely" ;; esac
+  local self tmp
+  self=$(readlink -f -- "${BASH_SOURCE[0]}")
+  confirm "Install warn-only apt hook $GBL_APT_HOOK (needs sudo)?" || die "aborted"
+  run_root install -d -m 0755 -- "$GBL_APT_HELPER_DIR"
+  run_root install -m 0755 -o root -g root -- "$self" "$GBL_APT_HELPER_DIR/grokbot-lite"
+  tmp=$(mktemp); apt_hook_content "$GBL_BINARY" >"$tmp"
+  run_root install -m 0644 -o root -g root -- "$tmp" "$GBL_APT_HOOK"
+  rm -f -- "$tmp"
+}
+
+cmd_apt_check() { # runs as root from DPkg::Post-Invoke - strictly read-only, always exit 0
+  resolve_binary
+  [[ -f $GBL_BINARY ]] || return 0
+  local state
+  state=$(runasnode_state "$GBL_BINARY")
+  [[ $state == enabled ]] && return 0
+  local msg="grokbot-lite: '$GBL_BINARY' has RunAsNode=$state (package upgrade reset the fuse). As your normal user run: grokbot-lite fix --restart"
+  printf '\n*** %s ***\n\n' "$msg" >&2
+  if have logger; then logger -t grokbot-lite -p user.warning -- "$msg" 2>/dev/null || true; fi
+  return 0
+}
+
+cmd_install() {
+  local supervisor_src="" do_linger=1 do_timer=1 do_policy=1 apt_hook=0 restart=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --supervisor-src) supervisor_src=${2:?--supervisor-src needs a directory}; shift ;;
+      --no-linger) do_linger=0 ;; --no-timer) do_timer=0 ;; --no-policy) do_policy=0 ;;
+      --apt-hook) apt_hook=1 ;; --restart) restart=1 ;;
+      *) die "install: unknown option $1" ;;
+    esac
+    shift
+  done
+  require_not_root
+  resolve_binary
+
+  info "1/7 dependency check"
+  local missing="" c
+  for c in grep dd od sha256sum stat install df awk sed systemctl loginctl; do have "$c" || missing+=" $c"; done
+  have "$GBL_SUDO" || missing+=" $GBL_SUDO"
+  [[ -z $missing ]] || die "missing commands:$missing"
+  LC_ALL=C grep --version 2>/dev/null | head -n1 | grep -q 'GNU grep' || die "GNU grep is required (byte offsets with -ob)"
+  [[ -f $GBL_BINARY ]] || die "official binary not found at '$GBL_BINARY' (install the grok-bot package or set GBL_BINARY)"
+  local ver; ver=$(package_version)
+  is_tested_version "$ver" || err "warning: $GBL_PACKAGE $ver is untested; continuing (doctor will verify)"
+
+  info "2/7 backup + 3/7 flip RunAsNode fuse"
+  flip_fuse
+
+  info "4/7 supervisor (andreanjos/grokbot-headless)"
+  if [[ ! -x $GBL_SUPERVISOR_BIN ]]; then
+    if [[ -n $supervisor_src ]]; then
+      [[ -x $supervisor_src/install.sh ]] || die "$supervisor_src/install.sh not found"
+      info "running upstream installer from $supervisor_src (review it first)"
+      (cd -- "$supervisor_src" && run ./install.sh)
+    else
+      die "supervisor not installed. Clone and review https://github.com/andreanjos/grokbot-headless, then: grokbot-lite install --supervisor-src <dir>"
+    fi
+  fi
+  if [[ $DRY_RUN -eq 0 ]]; then
+    local envf="$GBL_SUPERVISOR_CONFIG/environment" cur
+    cur=$(env_file_get GROK_BOT_BINARY "$envf" 2>/dev/null) || cur=""
+    [[ -z $cur || $cur == "$GBL_BINARY" ]] || err "warning: $envf points GROK_BOT_BINARY at '$cur', not '$GBL_BINARY'"
+  fi
+  run systemctl_user enable "$GBL_SUPERVISOR_UNIT"
+
+  info "5/7 linger"
+  if [[ $do_linger -eq 1 ]]; then
+    local linger; linger=$(loginctl show-user "${USER:-$(id -un)}" -p Linger --value 2>/dev/null) || linger=""
+    if [[ $linger == yes ]]; then info "linger already enabled"
+    elif confirm "Enable linger so the user service starts at boot without login (sudo loginctl enable-linger)?"; then
+      run_root loginctl enable-linger "${USER:-$(id -un)}"
+    fi
+  fi
+
+  info "6/7 execution policy -> ask"
+  if [[ $do_policy -eq 1 ]]; then
+    local pol; pol=$(json_field_str "$GBL_SUPERVISOR_DATA/settings.json" localToolPermission 2>/dev/null) || pol=""
+    if [[ ! -f $GBL_SUPERVISOR_CONFIG/credentials.json ]]; then
+      say "not logged in yet. Next: $GBL_SUPERVISOR_BIN login  (open the printed one-time URL yourself, never share it)"
+      say "then:  $GBL_SUPERVISOR_BIN policy ask && systemctl --user start $GBL_SUPERVISOR_UNIT"
+    elif [[ $pol == ask ]]; then info "policy already ask"
+    else
+      [[ $pol == always ]] && err "current policy is 'always'; switching to 'ask'"
+      run "$GBL_SUPERVISOR_BIN" policy ask   # grokbot-lite never sets 'always'
+    fi
+  fi
+
+  info "7/7 doctor timer"
+  [[ $do_timer -eq 1 ]] && cmd_install_timer
+  [[ $apt_hook -eq 1 ]] && cmd_install_apt_hook
+  if [[ $restart -eq 1 ]]; then run systemctl_user restart "$GBL_SUPERVISOR_UNIT"
+  else info "start/restart when ready: systemctl --user restart $GBL_SUPERVISOR_UNIT"; fi
+  say "${C_GRN}done.${C_OFF} Check with: grokbot-lite doctor"
+}
+
+cmd_uninstall() {
+  local keep_fuse=0 purge=0 purge_backups=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --keep-fuse) keep_fuse=1 ;; --purge) purge=1 ;; --purge-backups) purge_backups=1 ;;
+      *) die "uninstall: unknown option $1" ;;
+    esac
+    shift
+  done
+  require_not_root
+  resolve_binary
+  if [[ -f $GBL_SYSTEMD_USER_DIR/$TIMER_UNIT ]]; then
+    run systemctl_user disable --now "$TIMER_UNIT" || true
+    run rm -f -- "$GBL_SYSTEMD_USER_DIR/$TIMER_UNIT" "$GBL_SYSTEMD_USER_DIR/$DOCTOR_UNIT"
+    run systemctl_user daemon-reload || true
+  fi
+  if [[ -f $GBL_APT_HOOK ]] && confirm "Remove apt hook $GBL_APT_HOOK (sudo)?"; then
+    run_root rm -f -- "$GBL_APT_HOOK" "$GBL_APT_HELPER_DIR/grokbot-lite"
+    run_root rmdir -- "$GBL_APT_HELPER_DIR" 2>/dev/null || true
+  fi
+  if [[ $keep_fuse -eq 0 && $(runasnode_state "$GBL_BINARY") == enabled ]]; then
+    if find_pristine_backup "$(package_version)" >/dev/null; then cmd_restore
+    else err "no matching backup; to undo the fuse change run: sudo apt reinstall $GBL_PACKAGE"; fi
+  fi
+  [[ $purge -eq 1 ]] && run rm -rf -- "$GBL_STATE_DIR" "$GBL_CONFIG_DIR"
+  [[ $purge_backups -eq 1 ]] && run rm -rf -- "$GBL_BACKUP_DIR"
+  run rm -f -- "$GBL_BIN_DIR/grokbot-lite"
+  say "grokbot-lite removed. The supervisor (grok-bot-headless) was not touched; see its ./uninstall.sh."
+}
+
+usage() {
+  cat <<EOF
+grokbot-lite $GBL_TOOL_VERSION - run the official Grok Bot local-exec daemon headless
+
+usage: grokbot-lite [--yes] [--dry-run] [--binary PATH] [--user NAME] <command> [options]
+
+  On servers set up by install.sh, run as root: doctor/status/switch-account are
+  executed as the service user (GBL_SERVICE_USER in /etc/grokbot-lite.conf).
+
+commands:
+  install [--supervisor-src DIR] [--apt-hook] [--restart] [--no-linger|--no-timer|--no-policy]
+                       check deps, back up, flip RunAsNode, enable supervisor + linger,
+                       set policy ask, install doctor timer
+  doctor [--json] [--quiet] [--notify]
+                       health check (exit 0 ok, 1 warnings, 2 failure); read-only
+                       unless --notify (writes $GBL_STATE_DIR)
+  status [--json]      short status / machine-readable snapshot (read-only)
+  fix [--restart]      re-flip RunAsNode after a package upgrade (backs up first)
+  restore [--force]    put the original binary back from the verified backup
+  uninstall [--keep-fuse] [--purge] [--purge-backups]
+  switch-account       log out and log in again (wrong account), then policy ask + start
+  read-fuse [FILE]     print the Electron fuse wire of a binary (read-only)
+  install-timer        (re)install the systemd user doctor timer
+  install-apt-hook     install the warn-only apt hook (sudo)
+  apt-check            used by the apt hook; prints a warning only
+  version | help
+
+environment: GBL_BINARY GBL_BACKUP_DIR GBL_SUPERVISOR_BIN GBL_SUPERVISOR_UNIT GBL_NOTIFY_CMD ...
+EOF
+}
+
+exec_as_user() { # re-run this CLI as $GBL_SERVICE_USER (binary must be readable by that user)
+  local self=$1; shift
+  if [[ $self == /root/* ]]; then die "copy grokbot-lite to /usr/local/bin first (the service user cannot read $self)"; fi
+  user_exec "$GBL_SERVICE_USER" env GBL_NO_REEXEC=1 bash "$self" "$@"
+}
+
+main() {
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -y | --yes) YES=1 ;;
+      -n | --dry-run) DRY_RUN=1 ;;
+      --binary) GBL_BINARY=${2:?--binary needs a path}; shift ;;
+      --binary=*) GBL_BINARY=${1#--binary=} ;;
+      --user) GBL_SERVICE_USER=${2:?--user needs a name}; FORCE_USER=1; shift ;;
+      -h | --help) usage; return 0 ;;
+      -*) die "unknown global option $1" ;;
+      *) break ;;
+    esac
+    shift
+  done
+  local cmd=${1:-help}; [[ $# -gt 0 ]] && shift
+  # As root on a server, per-user commands run as the service user (see install.sh).
+  if [[ $EUID -eq 0 && -n $GBL_SERVICE_USER && ${GBL_NO_REEXEC:-0} != 1 ]]; then
+    case $cmd in
+      doctor | status | switch-account | install-timer)
+        local self flags=()
+        self=$(readlink -f -- "${BASH_SOURCE[0]}")
+        [[ $YES -eq 1 ]] && flags+=(--yes)
+        [[ $DRY_RUN -eq 1 ]] && flags+=(--dry-run)
+        exec_as_user "$self" "${flags[@]}" "$cmd" "$@"
+        return $? ;;
+    esac
+  elif [[ ${FORCE_USER:-0} -eq 1 && $EUID -ne 0 ]]; then
+    die "--user only works as root (you can run the command directly as that user)"
+  fi
+  case $cmd in
+    install) cmd_install "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    status) cmd_status "$@" ;;
+    fix) cmd_fix "$@" ;;
+    restore) cmd_restore "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    read-fuse) cmd_read_fuse "$@" ;;
+    install-timer) require_not_root; cmd_install_timer ;;
+    switch-account) cmd_switch_account "$@" ;;
+    install-apt-hook) require_not_root; cmd_install_apt_hook ;;
+    apt-check) cmd_apt_check ;;
+    version | --version) say "grokbot-lite $GBL_TOOL_VERSION" ;;
+    help) usage ;;
+    *) usage >&2; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

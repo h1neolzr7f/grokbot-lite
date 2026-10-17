@@ -1,0 +1,12 @@
+[Unit]
+Description=grokbot-lite: check the headless Grok Bot daemon (RunAsNode fuse, supervisor, policy)
+After=grok-bot-headless.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/grokbot-lite/config
+ExecStart=%h/.local/bin/grokbot-lite doctor --quiet --notify
+# doctor: 0 = healthy, 1 = warnings only, 2 = failure (unit shows as failed)
+SuccessExitStatus=1
+Nice=10
+IOSchedulingClass=idle

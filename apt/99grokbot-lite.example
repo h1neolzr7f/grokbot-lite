@@ -1,0 +1,3 @@
+// Example of what `grokbot-lite install-apt-hook` writes to /etc/apt/apt.conf.d/99grokbot-lite.
+// Warn-only: never modifies anything, never runs npx/network. Always succeeds.
+DPkg::Post-Invoke { "if [ -x /usr/local/lib/grokbot-lite/grokbot-lite ]; then GBL_BINARY='/opt/Grok Bot/grok-bot' /usr/local/lib/grokbot-lite/grokbot-lite apt-check || true; fi"; };

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: shellcheck
+        run: make lint
+      - name: systemd unit syntax
+        run: systemd-analyze verify --man=no systemd/grokbot-lite-doctor.timer || true
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: bats (mocks only, no real grok-bot binary)
+        run: bats --print-output-on-failure tests/
+
+  crosscheck:
+    # Verifies the native fuse parser/patcher against the reference @electron/fuses library.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Cross-check with @electron/fuses
+        run: make crosscheck

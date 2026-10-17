@@ -1,0 +1,11 @@
+[Unit]
+Description=grokbot-lite: periodic doctor run (detects fuse reset after package upgrades)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+RandomizedDelaySec=60
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

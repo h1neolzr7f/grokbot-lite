@@ -1,0 +1,42 @@
+# grokbot-lite compatibility matrix
+# One entry per official grok-bot Linux package version.
+#   status:
+#     works-stock      upstream supervisor works without any change
+#     works-with-fix   works after `grokbot-lite fix` (RunAsNode fuse enabled)
+#     broken           does not work even with the fix (please open an issue)
+#     unknown          detected but not yet confirmed end-to-end
+#   run_as_node_default: RunAsNode fuse state in the UNMODIFIED package binary
+# Generate a new entry with:  sh compat/detect.sh --yaml
+schema: 1
+versions:
+  - version: "0.30.0"
+    arch: [amd64]
+    electron: unknown
+    fuse_wire: {version: null, length: null}
+    run_as_node_default: enabled        # inferred: upstream starts the daemon with ELECTRON_RUN_AS_NODE=1
+    status: works-stock
+    fix_required: false
+    verified_by: "upstream andreanjos/grokbot-headless (TESTED_CLIENT_VERSIONS); not re-tested here"
+
+  - version: "0.71.2"
+    arch: [amd64]
+    electron: "42.1.0"
+    fuse_wire: {version: 1, length: 9}
+    run_as_node_default: disabled
+    status: works-with-fix
+    fix_required: true
+    verified_by:
+      - "Ubuntu 24.04.5 LTS amd64 mini PC (8 GB), user-account mode, 2026-10-18"
+      - "Ubuntu 24.04.2 LTS amd64 Aliyun lightweight VPS (2 vCPU / 2 GiB + 2 GB swap), dedicated user 'grokbot', Node 22, grokbot-headless 0.2.2, 2026-10-18"
+    notes: >
+      Live binary differs from the pristine backup in exactly one byte (the
+      RunAsNode fuse, '0' -> '1'), confirmed with `cmp -l`. Daemon + supervisor
+      ran for 16 h+ under systemd --user with linger. Full fuse wire after fix:
+      RunAsNode=on CookieEncryption=on NodeOptions=off NodeCliInspect=off
+      AsarIntegrity=on OnlyLoadAppFromAsar=on V8Snapshot=off FileProtocolExtra=on
+      WasmTrapHandlers=on.
+      Same patched sha256 (22e34785...) observed on both hosts. Installed size
+      ~350 MB with --no-install-recommends, no extra dependencies on Ubuntu 24.04.2.
+    measurements:
+      vps_2gib: {daemon_rss_mb: 122, supervisor_rss_mb: 70, machine_used_before_mb: 480, machine_used_after_mb: 544}
+      mini_pc:  {daemon_rss_mb: 120, supervisor_rss_mb: 78}

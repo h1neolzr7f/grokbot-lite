@@ -1,0 +1,9 @@
+.cache/
+node_modules/
+*.tgz
+# never commit secrets or vendor binaries
+credentials.json
+machine.json
+*credential*.json
+grok-bot
+grok-bot.*

@@ -1,0 +1,26 @@
+name: Compatibility report
+description: Report whether a grok-bot version works (or not) with grokbot-lite
+labels: [compat]
+body:
+  - type: markdown
+    attributes:
+      value: Run `sh compat/detect.sh --yaml` on a fresh (un-fixed) install or against your backup file.
+  - type: textarea
+    id: detect
+    attributes:
+      label: Output of `sh compat/detect.sh --yaml`
+      render: yaml
+    validations:
+      required: true
+  - type: dropdown
+    id: status
+    attributes:
+      label: Result
+      options: [works-stock, works-with-fix, broken]
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `grokbot-lite doctor` after fix (redacted)
+      render: text
