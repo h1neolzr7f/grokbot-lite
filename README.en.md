@@ -5,8 +5,10 @@
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64%20%7C%20systemd-blue)
 ![RAM](https://img.shields.io/badge/RAM-~190%20MB%20on%20a%202%20GiB%20VPS-brightgreen)
 
-**Turn a cheap 1–2 GB cloud VPS into a 24/7 remote dev box that Grok Bot can operate — in ~190 MB of RAM.**
-No desktop, no Xvfb, not running as root.
+**Make Grok Bot run on Linux servers that have no graphical desktop — and keep it lightweight.**
+
+The official client is a desktop app. On a headless cloud VPS it either will not start, or a forced headless Electron session needs Xvfb and ~740 MB of RAM.
+**grokbot-lite** is a working no-GUI setup (dedicated user + systemd + a 1-byte RunAsNode fuse flip) so the remote-exec daemon runs in about **190 MB** total — no desktop, no Xvfb, not as root. A cheap 1–2 GB VPS becomes a 24/7 remote dev box.
 
 > ⚠️ **Unofficial.** Not affiliated with xAI or the Grok Bot team. It modifies one Electron fuse (RunAsNode) in the
 > official binary **at your own risk**; a backup is made first and `grokbot-lite restore` undoes it.
@@ -48,10 +50,12 @@ one-click script has not yet run end-to-end on real hardware. **Compatibility re
 
 ## Why
 
-The full Electron client started headless needs ~740 MB plus Xvfb. grokbot-headless avoids that, but official
-0.71.2 disabled Electron's RunAsNode fuse, so it crashes. grokbot-lite flips that single byte (backup first,
-one-command restore, upgrade detection) and packages the whole server setup. We know of no other ready-made way to
-run Grok Bot remote execution on a 1–2 GB headless VPS.
+**The core problem: the official Grok Bot client needs a graphical desktop**, so it cannot run on a normal headless
+Linux server. Starting the full Electron client "headless" still needs Xvfb and ~740 MB. Community grokbot-headless
+avoids the window, but official 0.71.2 disabled Electron's RunAsNode fuse, so it crashes. grokbot-lite restores a
+working no-GUI path (flip that one byte, backup first, one-command restore, upgrade detection) and packages the
+whole server setup — with memory down to ~190 MB as a bonus. We know of no other ready-made way to run Grok Bot
+remote execution on a headless Linux cloud VPS (especially 1–2 GB).
 
 ## Measured
 
