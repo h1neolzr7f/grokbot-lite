@@ -11,7 +11,7 @@ grokbot-lite 的目标：把一台**低内存、无显示器**的 Linux 机器�
 阿里云/腾讯云轻量应用服务器这类几十元一年起（以厂商活动价为准）的 KVM VPS，用一键脚本安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB/grokbot-lite/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/h1neolzr7f/grokbot-lite/main/install.sh | sudo bash
 ```
 
 实测 2 GiB 机器上 Grok Bot 只占约 190 MB，剩下 1 GB 左右可用。典型用法：

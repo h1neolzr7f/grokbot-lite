@@ -18,7 +18,7 @@ set -euo pipefail
 INSTALLER_VERSION="0.2.0"
 
 # ---------------------------------------------------------------- settings
-: "${GBL_REPO_RAW:=https://raw.githubusercontent.com/YOUR-GITHUB/grokbot-lite/main}"   # placeholder
+: "${GBL_REPO_RAW:=https://raw.githubusercontent.com/h1neolzr7f/grokbot-lite/main}"
 : "${GBL_SERVICE_USER:=grokbot}"
 : "${GBL_NODE_DIR:=/opt/node22}"
 : "${GBL_NODE_MAJOR:=22}"

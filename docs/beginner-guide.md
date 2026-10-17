@@ -35,7 +35,7 @@
 复制粘贴这一行，回车：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB/grokbot-lite/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/h1neolzr7f/grokbot-lite/main/install.sh | sudo bash
 ```
 
 > 如果你是 `ubuntu` 用户，`sudo` 可能会问一次密码，就是你在第 2 步设置的密码。

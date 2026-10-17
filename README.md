@@ -1,11 +1,14 @@
 # grokbot-lite
 
-[![CI](https://img.shields.io/badge/CI-shellcheck%20%2B%20bats-blue)](.github/workflows/ci.yml)
+[![CI](https://github.com/h1neolzr7f/grokbot-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/h1neolzr7f/grokbot-lite/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Linux%20x86__64%20%7C%20systemd-blue)
 ![RAM](https://img.shields.io/badge/RAM-~190%20MB%20on%20a%202%20GiB%20VPS-brightgreen)
 
 **把一台几十块钱一年的 1–2 GB 云服务器，变成 Grok Bot 可以 24 小时远程操作的开发机。**
 Grok Bot 远程执行后台只占约 **190 MB** 内存，不需要桌面、不需要 Xvfb、不用 root 跑。
+
+> ⚠️ **非官方项目**：与 xAI / Grok Bot 官方无关。它会修改官方二进制里的一个 Electron fuse（RunAsNode），**风险自负**；改之前会自动备份，可一键还原。
 
 [English](README.en.md) · [新手教程：从买服务器到连上](docs/beginner-guide.md) · [新手 FAQ](docs/faq.md) · [内存基准](docs/benchmark.md) · [安全设计](docs/security.md) · [适用场景](docs/use-cases.md) · [原理](docs/how-it-works.md) · [兼容性](compat/README.md)
 
@@ -14,10 +17,10 @@ Grok Bot 远程执行后台只占约 **190 MB** 内存，不需要桌面、不�
 在一台全新的 **Ubuntu 24.04 / 22.04 或 Debian 12** 云服务器（阿里云/腾讯云轻量、任何 KVM VPS）上，用 root 或 sudo 运行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB/grokbot-lite/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/h1neolzr7f/grokbot-lite/main/install.sh | sudo bash
 ```
 
-> `YOUR-GITHUB` 是占位符，发布后替换成仓库地址。想先看脚本内容：把 `| sudo bash` 换成 `-o install.sh`，看完再 `sudo bash install.sh`。
+> 想先看脚本内容：把 `| sudo bash` 换成 `-o install.sh`，看完再 `sudo bash install.sh`。
 
 脚本会用中文一步步提示，只问几个是/否问题（直接回车就是安全的默认选项），然后自动完成：
 
@@ -39,6 +42,18 @@ curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB/grokbot-lite/main/insta
 | 出问题看日志 | `sudo tail -n 50 /var/log/grokbot-lite-install.log` |
 
 脚本可以**重复运行**：已完成的步骤会自动跳过，中途失败修好后再跑一次即可。
+
+## 测试情况（请先看）
+
+| ✅ 已实测 | ⚠️ 尚未测试 |
+| --- | --- |
+| Ubuntu 24.04 x86_64，2 GiB 云服务器（阿里云轻量）| `install.sh` 在全新机器上**从头到尾**完整跑一遍 |
+| Ubuntu 24.04 x86_64，8 GB 小主机 | arm64 |
+| grok-bot 0.71.2（Electron 42.1.0）| Debian 12、Ubuntu 22.04 |
+| `doctor` / `status --json` / `read-fuse` / fuse 补丁（只改 1 字节）| 1 GB 内存机器（文档中的 1 GB 数据为估算）|
+
+VPS 是按同样流程手工搭建的，一键脚本的每一步都有自动化测试（全 mock），但还没在真机上整体跑过。
+**欢迎反馈兼容性**：跑完后用 `sh compat/detect.sh --yaml` 生成报告，通过 [Compatibility report](https://github.com/h1neolzr7f/grokbot-lite/issues/new?template=compat_report.yml) 提交（成功、失败都有用）。
 
 ## 为什么需要它
 
@@ -121,5 +136,5 @@ make chart            # 重新生成内存图
 ## 致谢与声明
 
 - 监督进程：[andreanjos/grokbot-headless](https://github.com/andreanjos/grokbot-headless)（MIT）。Fuse 格式参考：[electron/fuses](https://github.com/electron/fuses)。
-- 本项目是独立的非官方项目，与 xAI 及 Grok Bot 官方无关，不包含任何专有代码或二进制。修改官方二进制可能不符合某些使用条款，请自行判断。
+- 本项目是独立的非官方项目，与 xAI 及 Grok Bot 官方无关，不包含任何专有代码或二进制。它会修改官方二进制中的 Electron fuse，修改官方二进制可能不符合某些使用条款，**风险自负**；软件按 MIT 协议“按原样”提供，不作任何担保。
 - 许可证：[MIT](LICENSE)。

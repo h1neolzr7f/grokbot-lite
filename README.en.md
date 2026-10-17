@@ -1,7 +1,15 @@
 # grokbot-lite
 
+[![CI](https://github.com/h1neolzr7f/grokbot-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/h1neolzr7f/grokbot-lite/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Linux%20x86__64%20%7C%20systemd-blue)
+![RAM](https://img.shields.io/badge/RAM-~190%20MB%20on%20a%202%20GiB%20VPS-brightgreen)
+
 **Turn a cheap 1–2 GB cloud VPS into a 24/7 remote dev box that Grok Bot can operate — in ~190 MB of RAM.**
 No desktop, no Xvfb, not running as root.
+
+> ⚠️ **Unofficial.** Not affiliated with xAI or the Grok Bot team. It modifies one Electron fuse (RunAsNode) in the
+> official binary **at your own risk**; a backup is made first and `grokbot-lite restore` undoes it.
 
 [中文](README.md) · [Benchmark](docs/benchmark.md) · [Security](docs/security.md) · [Use cases](docs/use-cases.md) · [How it works](docs/how-it-works.md) · [Compatibility](compat/README.md)
 
@@ -10,10 +18,10 @@ No desktop, no Xvfb, not running as root.
 On a fresh Ubuntu 24.04/22.04 or Debian 12 KVM server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB/grokbot-lite/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/h1neolzr7f/grokbot-lite/main/install.sh | sudo bash
 ```
 
-(`YOUR-GITHUB` is a placeholder.) The installer (Chinese prompts, safe defaults) checks OS/arch/RAM/disk/systemd,
+The installer (Chinese prompts, safe defaults) checks OS/arch/RAM/disk/systemd,
 offers swap, adds the official apt repo and installs `grok-bot` with `--no-install-recommends`, installs Node 22 to
 `/opt/node22` if the system Node is older than 20 (sha256-verified, system Node untouched), creates a dedicated
 non-root user `grokbot` without sudo, enables linger, backs up the official binary and flips **only** the RunAsNode
@@ -23,6 +31,20 @@ the service and runs `doctor`.
 
 Flags: `--yes` (non-interactive, safe defaults), `--switch-account` (wrong account → logout + new link),
 `--uninstall`, `--no-login`, `--dry-run`, `--log FILE` (default `/var/log/grokbot-lite-install.log`). Re-runnable.
+
+## Tested on / Not yet tested
+
+| ✅ Tested | ⚠️ Not yet tested |
+| --- | --- |
+| Ubuntu 24.04 x86_64, 2 GiB cloud VPS (Aliyun lightweight) | A full end-to-end run of `install.sh` on a fresh machine |
+| Ubuntu 24.04 x86_64, 8 GB mini PC | arm64 |
+| grok-bot 0.71.2 (Electron 42.1.0) | Debian 12, Ubuntu 22.04 |
+| `doctor` / `status --json` / `read-fuse` / 1-byte fuse patch | 1 GB RAM hosts (1 GB numbers in the docs are estimates) |
+
+The VPS was set up manually following the same steps; every installer step is covered by mocked bats tests, but the
+one-click script has not yet run end-to-end on real hardware. **Compatibility reports are very welcome** — run
+`sh compat/detect.sh --yaml` and open a [Compatibility report](https://github.com/h1neolzr7f/grokbot-lite/issues/new?template=compat_report.yml)
+(successes and failures both help).
 
 ## Why
 
@@ -61,4 +83,5 @@ re-executed as the service user from `/etc/grokbot-lite.conf`. On a desktop/mini
 ## Legal
 
 Independent, unofficial project; not affiliated with xAI or the Grok Bot team. No proprietary code or binaries.
-Modifying the official binary may conflict with some terms of use. MIT licensed.
+It modifies an Electron fuse in the official binary; this may conflict with some terms of use — **use at your own
+risk**. MIT licensed, provided "as is" without warranty.

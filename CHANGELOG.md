@@ -14,6 +14,10 @@
 - 文档：新手教程（从买服务器到连上）、新手 FAQ、VPS 实测基准与新图表、VPS 安全设计、VPS 场景。
 - 16 个安装器 bats 测试。
 
+### Docs
+- README 顶部加入 CI/许可证/平台徽章、非官方与“风险自负”声明，以及“已实测 / 尚未测试”表格和兼容性反馈入口。
+- 安装命令中的仓库占位符替换为 `h1neolzr7f/grokbot-lite`。
+
 ### Verified
 - 阿里云轻量 2 GiB（Ubuntu 24.04.2）与小主机（Ubuntu 24.04.5）上只读运行 `doctor`、`status --json`、`read-fuse`、`detect.sh`。
   注意：`install.sh` 本身尚未在全新机器上端到端运行过（VPS 是按同样流程手工搭建的）。

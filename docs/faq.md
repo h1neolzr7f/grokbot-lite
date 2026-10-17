@@ -3,7 +3,7 @@
 ### Grok Bot 里看不到我的服务器
 九成是**登录错了账号**（浏览器里登录的不是你平时用的那个）。运行：
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR-GITHUB/grokbot-lite/main/install.sh | sudo bash -s -- --switch-account
+curl -fsSL https://raw.githubusercontent.com/h1neolzr7f/grokbot-lite/main/install.sh | sudo bash -s -- --switch-account
 ```
 它会退出当前账号、生成新链接。打开前先确认浏览器里是对的账号。其余情况运行 `sudo grokbot-lite doctor` 看哪一项是 `[FAIL]`。
 
