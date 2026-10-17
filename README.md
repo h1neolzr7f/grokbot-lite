@@ -134,7 +134,7 @@ make crosscheck       # 与 @electron/fuses 官方库交叉验证 fuse 解析
 make chart            # 重新生成内存图
 ```
 
-见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+见 [CONTRIBUTING.md](CONTRIBUTING.md)。CI 工作流见 [docs/ci.md](docs/ci.md)（当前以 example 形式提供）。
 
 ## 致谢与声明
 

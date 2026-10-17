@@ -84,6 +84,8 @@ re-executed as the service user from `/etc/grokbot-lite.conf`. On a desktop/mini
   0.71.2 binary (all fuses plainly on/off) it changes exactly one byte, as verified; grokbot-lite's native patcher
   guarantees that for any wire and is cross-checked against the library in CI.
 
+See also [docs/ci.md](docs/ci.md) (Actions workflow currently ships as an example).
+
 ## Legal
 
 Independent, unofficial project; not affiliated with xAI or the Grok Bot team. No proprietary code or binaries.
